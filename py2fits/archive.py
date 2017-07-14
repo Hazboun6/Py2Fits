@@ -65,10 +65,10 @@ SEARCH = "SEARCH"
 
 
 class Archive:
-    def __init__(self,filename,prepare=True,lowmem=False,verbose=True,weight=True,center_pulse=True,baseline_removal=True,wcfreq=True,thread=False,cuda=False):
+    def __init__(self,filename,prepare=False,lowmem=False,verbose=True,weight=False,center_pulse=False,baseline_removal=False,wcfreq=False,thread=False,cuda=False):
         ## Parse filename here
         self.pypulse_history = []
-        self.record(inspect.currentframe())
+        #self.record(inspect.currentframe())
         self.filename = str(filename) #fix unicode issue
         self.prepare = prepare
         self.lowmem = lowmem
@@ -107,16 +107,16 @@ class Archive:
 
 
 
-    def load(self,filename,prepare=True,center_pulse=True,baseline_removal=True,weight=True,wcfreq=False):
+    def load(self,filename,prepare=False,center_pulse=False,baseline_removal=False,weight=False,wcfreq=False):
         """
-        Loads a PSRFITS file and processes
+        Loads a PSRFITS file
         http://www.atnf.csiro.au/people/pulsar/index.html?n=PsrfitsDocumentation.Txt
         """
         if filename is None: #Needed?
             filename = self.filename
         try:
             if self.lowmem:
-                hdulist = pyfits.open(filename,ignore_missing_end=True,memmap=True)
+                hdulist = pyfits.open(filename,ignore_missing_end=True,memmap=True) #Probably don't need...
             else:
                 hdulist = pyfits.open(filename,ignore_missing_end=True)
         except IOError:
@@ -129,14 +129,21 @@ class Archive:
         if 'HISTORY' in self.keys:
             tablenames.remove('HISTORY')
             self.history = History(hdulist['HISTORY'])
-            nsubint = self.history.getLatest("NSUB")
-            npol = self.history.getLatest("NPOL")
-            nchan = self.history.getLatest("NCHAN")
-            nbin = self.history.getLatest("NBIN")
+            self.nsubint = self.history.getLatest("NSUB")
+            self.npol = self.history.getLatest("NPOL")
+            self.nchan = self.history.getLatest("NCHAN")
+            self.nbin = self.history.getLatest("NBIN")
+            self.nsblk = self.history.getLatest("NSBLK")
         else:
             self.history = None
-            nsubint = hdulist['SUBINT'].header['NAXIS2']
-            nbin,nchan,npol,nsblk = fmap(int,hdulist['SUBINT'].columns[-1].dim[1:-1].split(","))
+            self.nsubint = hdulist['SUBINT'].header['NAXIS2']
+            self.nbin,self.nchan,self.npol,self.nsblk = fmap(int,hdulist['SUBINT'].columns[-1].dim[1:-1].split(","))
+
+        nsubint = self.nsubint
+        npol = self.npol
+        nchan = self.nchan
+        nbin = self.nbin
+        nsblk = self.nsblk
 
         if 'PSRPARAM' in self.keys:
             tablenames.remove('PSRPARAM')
@@ -200,8 +207,8 @@ class Archive:
             self.subintheader[key] = hdulist['SUBINT'].header[key]
 
         DATA = hdulist['SUBINT'].data['DATA']
-        if np.ndim(DATA)==5:
-            DATA = DATA[:,0,:,:,:] #remove the nsblk column
+        #if np.ndim(DATA)==5:
+        #    DATA = DATA[:,0,:,:,:] #remove the nsblk column
         DATA = np.ascontiguousarray(DATA)
 
         #Definitions in Base/Formats/PSRFITS/ProfileColumn.C
@@ -260,11 +267,11 @@ class Archive:
             DAT_OFFS = np.memmap(tfDAT_OFFS.name,dtype=np.float32,mode='r',shape=SHAPE)
             '''
 
-            tf = tempfile.NamedTemporaryFile()
-            self.data = np.memmap(tf.name,dtype=np.float32,mode='w+',shape=(nsubint,npol,nchan,nbin))
+            #tf = tempfile.NamedTemporaryFile()
+            self.data = DATA#np.memmap(tf.name,dtype=np.float32,mode='w+',shape=(nsubint,nsblk,npol,nchan,nbin))
 
         else:
-            self.data = np.zeros((nsubint,npol,nchan,nbin))
+            self.data = DATA#np.zeros((nsubint,nsblk,npol,nchan,nbin))
 
         #self.data = np.zeros((nsubint,npol,nchan,nbin))
         #data = np.zeros((nsubint,npol,nchan,nbin))
@@ -276,119 +283,6 @@ class Archive:
 
         self.freq = DAT_FREQ
 
-
-
-
-        if nsubint == 1 and npol == 1 and nchan == 1:
-            self.data = (DAT_SCL*DATA+DAT_OFFS)#*DAT_WTS
-        elif nsubint == 1 and npol == 1:
-            for k in K:
-                self.data[0,0,k,:] = (DAT_SCL[0,k]*DATA[0,0,k,:]+DAT_OFFS[0,k])#*DAT_WTS[0,k] #dat WTS[0]?
-        elif nsubint == 1 and nchan == 1:
-            for j in J:
-                self.data[0,j,0,:] = (DAT_SCL[0,j]*DATA[0,j,0,:]+DAT_OFFS[0,j])#*DAT_WTS[0]
-        elif npol == 1 and nchan == 1:
-            for i in I:
-                self.data[i,0,0,:] = (DAT_SCL[i,0]*DATA[i,0,0,:]+DAT_OFFS[i,0])#*DAT_WTS[0]
-        else: #if nsubint == 1 or npol == 1 or nchan == 1 this works, or all three are not 1, might want to split this up
-            t0 = time.time()
-            cudasuccess = False
-            if self.cuda:
-                try:
-                    gpuarray = import_module('pycuda.gpuarray')
-                    compiler = import_module('pycuda.compiler')
-                    driver = import_module('pycuda.driver')
-                    autoinit = import_module('pycuda.autoinit')
-                    cudasuccess = True
-                except ImportError:
-                    print("PyCUDA not imported")
-                    #                __global__ void combine(float *retval, float *DAT_SCL, float *DATA, float *DAT_OFFS, int nbin)
-                mod = compiler.SourceModule("""
-                __global__ void combine(int16_t *retval, float *DAT_SCL, int16_t *DATA, float *DAT_OFFS, int nbin, int size)
-                {
-                    //uint idx = threadIdx.x + threadIdx.y*4;
-                    uint xidx = blockDim.x * blockIdx.x + threadIdx.x;
-                    uint yidx = blockDim.y * blockIdx.y + threadIdx.y;
-                    uint zidx = blockDim.z * blockIdx.z + threadIdx.z;
-                    uint idx = xidx + 5*yidx;
-                    if (idx < size)
-                        retval[idx] = 1;//DATA[idx];
-
-                    //int subidx = idx/nbin;
-                    //retval[idx] = ((DATA[idx] & 0x00FF) <<8) | ((DATA[idx]>>8) & 0x00ff); //swap-endian
-                    //retval[idx] = (double)(DAT_SCL[subidx]*DATA[idx]+DAT_OFFS[subidx]);
-                }
-                """)
-                combine = mod.get_function("combine")
-
-                maxX = autoinit.device.get_attributes()[driver.device_attribute.MAX_BLOCK_DIM_X]
-                maxY = autoinit.device.get_attributes()[driver.device_attribute.MAX_BLOCK_DIM_Y]
-                maxZ = autoinit.device.get_attributes()[driver.device_attribute.MAX_BLOCK_DIM_Z]
-
-
-
-
-
-
-                #combine(driver.Out(self.data),driver.In(np.ascontiguousarray(DAT_SCL)),driver.In(np.ascontiguousarray(DATA)),driver.In(np.ascontiguousarray(DAT_OFFS)),nbin,block=(4,4,1))
-                data = np.zeros(np.shape(self.data),dtype='>i2')
-
-                if nsubint <= maxX:
-                    X = int(nsubint)
-                    gridX = 1
-                else:
-                    pass
-                # Assume maxZ >= 4 for now
-                Z = int(npol)
-                gridZ = 1
-                if nchan <= maxY:
-                    Y = int(nchan)
-                    gridY = 1
-                else:
-                    pass
-
-                print(np.shape(data),np.size(data))
-                retval = np.zeros(np.shape(self.data),dtype='>i2')
-                print(X,Y,Z)
-                combine(driver.Out(retval),driver.In(DAT_SCL),driver.In(data),driver.In(DAT_OFFS),np.int32(nbin),np.int32(np.size(data)),block=(X,1,1),grid=(1,Z,Y))
-
-                raise SystemExit
-
-                #combine(driver.Out(DATA),driver.In(DAT_SCL),driver.In(DATA),driver.In(DAT_OFFS),nbin,block=(4,4,1))
-
-                combine(driver.Out(retval),driver.In(DAT_SCL),driver.In(data),driver.In(DAT_OFFS),nbin,block=(4,4,4))
-                #combine(data_gpu,driver.In(DAT_SCL),data_gpu,driver.In(DAT_OFF),nbin,block=(4,4,1))
-
-                #driver.memcpy_dtoh(retval, data_gpu)
-                #combine(driver.Out(data),driver.In(DAT_SCL),driver.In(DATA),driver.In(DAT_OFFS),nbin,block=(4,4,1))
-                #print "Break1"
-                #print retval,np.all(retval==256)
-                #print np.shape(retval)
-                #print len(np.where(retval==256)[0])
-                #for i in retval:
-                #    print i,
-                #print "break"
-                #print data.#dtype,DATA.dtype
-                raise SystemExit
-
-            if self.thread and cudasuccess == False:
-                def loop_func(i):
-                    for j in J:
-                        jnchan = j*nchan
-                        for k in K:
-                            self.data[i,j,k,:] = (DAT_SCL[i,jnchan+k]*DATA[i,j,k,:]+DAT_OFFS[i,jnchan+k])#*DAT_WTS[i,k]
-                u.parmap(loop_func,I)
-            elif cudasuccess == False:
-                for i in I:
-                    for j in J:
-                        jnchan = j*nchan
-                        for k in K:
-                            self.data[i,j,k,:] = (DAT_SCL[i,jnchan+k]*DATA[i,j,k,:]+DAT_OFFS[i,jnchan+k])#*DAT_WTS[i,k]
-            t1 = time.time()
-            #print t1-t0
-
-
-
         bw = self.getBandwidth()
 
 
@@ -396,19 +290,6 @@ class Archive:
         self.durations = self.getSubintinfo('TSUBINT')
         self.subint_starts = np.array(fmap(Decimal,self.getSubintinfo('OFFS_SUB')),dtype=np.dtype(Decimal))#+self.getTbin(numwrap=Decimal)*Decimal(nbin/2.0)#+self.getMJD(full=False,numwrap=Decimal) #converts center-of-bin times to start-of-bin times, in seconds, does not include the integer MJD part. This means that a template sitting in the center will have zero extra time
         self.channel_delays = np.zeros(nchan,dtype=np.dtype(Decimal)) #used to keep track of frequency-dependent channel delays, in time units.
-
-        if prepare and not self.isCalibrator():
-            self.pscrunch()
-            self.dedisperse(wcfreq=wcfreq)
-
-        self.calculateAverageProfile()
-
-
-        if center_pulse and not self.isCalibrator() and prepare: #calibrator is not a pulse, prepare must be run so that dedisperse is run?
-            self.center()
-
-        if baseline_removal and not self.isCalibrator():
-            self.removeBaseline()
 
         hdulist.close()
         return
@@ -478,33 +359,31 @@ class Archive:
         cols.append(pyfits.Column(name='DAT_FREQ',format='%iE'%np.shape(self.freq)[1],unit='MHz',array=self.freq)) #correct size? check units?
         cols.append(pyfits.Column(name='DAT_WTS',format='%iE'%np.shape(self.weights)[1],array=self.weights)) #call getWeights()
 
-        nsubint = self.getNsubint()
-        npol = self.getNpol()
-        nchan = self.getNchan()
-        nbin = self.getNbin()
+        nsubint,nsblk,npol,nchan,nbin = self.data.shape
+
         DAT_OFFS = np.zeros((nsubint,npol*nchan),dtype=np.float32)
         DAT_SCL = np.zeros((nsubint,npol*nchan),dtype=np.float32)
-        DATA = self.getData(squeeze=False,weight=False)
-        saveDATA = np.zeros(self.shape(squeeze=False),dtype=np.int16)
+        DATA = self.data #getData(squeeze=False,weight=False)
+        saveDATA = self.data #np.zeros(self.shape(squeeze=False),dtype=np.int16)
         # Following Base/Formats/PSRFITS/unload_DigitiserCounts.C
-        for i in xrange(nsubint):
-            for j in xrange(npol):
-                jnchan = j*nchan
-                for k in xrange(nchan):
-                    MIN = np.min(DATA[i,j,k,:])
-                    MAX = np.max(DATA[i,j,k,:])
-                    RANGE = MAX - MIN
-                    if MAX == 0 and MIN == 0:
-                        DAT_SCL[i,jnchan+k] = 1.0
-                    else:
-                        DAT_OFFS[i,jnchan+k] = 0.5*(MIN+MAX)
-                        DAT_SCL[i,jnchan+k] = (MAX-MIN)/32766.0 #this is slightly off the original value? Results in slight change of data
-
-                    saveDATA[i,j,k,:] = np.floor((DATA[i,j,k,:] - DAT_OFFS[i,jnchan+k])/DAT_SCL[i,jnchan+k] + 0.5) #why +0.5?
+        #for i in xrange(nsubint):
+        #    for j in xrange(npol):
+        #        jnchan = j*nchan
+        #        for k in xrange(nchan):
+        #            MIN = np.min(DATA[i,j,k,:])
+        #            MAX = np.max(DATA[i,j,k,:])
+        #            RANGE = MAX - MIN
+        #            if MAX == 0 and MIN == 0:
+        #                DAT_SCL[i,jnchan+k] = 1.0
+        #            else:
+        #                DAT_OFFS[i,jnchan+k] = 0.5*(MIN+MAX)
+        #                DAT_SCL[i,jnchan+k] = (MAX-MIN)/32766.0 #this is slightly off the original value? Results in slight change of data
+        #
+        #            saveDATA[i,j,k,:] = np.floor((DATA[i,j,k,:] - DAT_OFFS[i,jnchan+k])/DAT_SCL[i,jnchan+k] + 0.5) #why +0.5?
 
         cols.append(pyfits.Column(name='DAT_OFFS',format='%iE'%np.size(DAT_OFFS[0]),array=DAT_OFFS))
         cols.append(pyfits.Column(name='DAT_SCL',format='%iE'%np.size(DAT_SCL[0]),array=DAT_SCL))
-        cols.append(pyfits.Column(name='DATA',format='%iI'%np.size(saveDATA[0]),array=saveDATA,unit='Jy',dim='(%s,%s,%s)'%(nbin,nchan,npol))) #replace the unit here
+        cols.append(pyfits.Column(name='DATA',format='%iI'%np.size(saveDATA[0]),array=saveDATA,unit='Jy',dim='(%s,%s,%s,%s,%s)'%(nbin,nsblk,npol,nchan,nbin))) #replace the unit here
 
         subinthdr = pyfits.Header()
         for key in self.subintheaderlist:
@@ -514,7 +393,7 @@ class Archive:
 
 
 
-        hdulist.writeto(filename,clobber=True)#clobber=True?
+        hdulist.writeto(filename,overwrite=True)#clobber=True?
 
 
 
@@ -540,7 +419,6 @@ class Archive:
         return np.shape(self.getData(squeeze=squeeze))
     def reset(self,prepare=True):
         """Replace the arch with the original clone"""
-        self.record(inspect.currentframe()) #temporary, actually change the history!
         if self.lowmem:
             self.load(self.filename,prepare=prepare)
         else:
@@ -550,131 +428,13 @@ class Archive:
         #if prepare:
         #    self.scrunch()
 
-    def getLevels(self,differences=False):
-        """ Returns calibration levels if this is a calibrator"""
-        if not self.isCalibrator():
-            print("Not a calibration file")
-            return
-        # Ensure data are scrunched in time, or ignore this and simply calculate the weighted time average?
-        self.tscrunch()
 
-        #Pre-define
-        data = self.getData()
-        npol = self.getNpol()
-        nchan = self.getNchan()
-        nbin = self.getNbin()
-
-        # Check header info CAL_DCYC, CAL_NPHS, etc, to determine on-diode
-        # or take an absolute value?
-        first = np.mean(data[0,:,:nbin/2])
-        second = np.mean(data[0,:,nbin/2:])
-        if first > second:
-            highinds = np.arange(0,nbin/2)
-            lowinds = np.arange(nbin/2,nbin)
-        else:
-            lowinds = np.arange(0,nbin/2)
-            highinds = np.arange(nbin/2,nbin)
-
-        # Calculate calibrations
-        freqs = self.getAxis('F')
-        if differences:
-            caldata = np.zeros((npol,nchan))
-            calerrs = np.zeros((npol,nchan))
-            for i in xrange(npol):
-                for j in xrange(nchan):
-                    caldata[i,j] = np.mean(data[i,j,highinds]) - np.mean(data[i,j,lowinds])
-                    calerrs[i,j] = np.sqrt(np.std(data[i,j,highinds])**2 / len(highinds) + np.std(data[i,j,lowinds])**2 / len(lowinds))
-        else:
-            caldatalow = np.zeros((npol,nchan))
-            caldatahigh = np.zeros((npol,nchan))
-            calerrslow = np.zeros((npol,nchan))
-            calerrshigh = np.zeros((npol,nchan))
-            for i in xrange(npol):
-                for j in xrange(nchan):
-                    caldatalow[i,j] = np.mean(data[i,j,lowinds])
-                    caldatahigh[i,j] = np.mean(data[i,j,highinds])
-                    calerrslow[i,j] = np.std(data[i,j,lowinds]) / np.sqrt(len(lowinds))
-                    calerrshigh[i,j] = np.std(data[i,j,highinds]) / np.sqrt(len(highinds))
-
-
-
-        if differences:
-            return freqs,caldata,calerrs
-        return freqs,caldatalow,caldatahigh,calerrslow,calerrshigh
-
-    def calibrate(self,psrcalar,fluxcalonar=None,fluxcaloffar=None):
-        """Calibrates using another archive"""
-        self.record(inspect.currentframe())
-        if not (isinstance(psrcalar,Calibrator) or (isinstance(psrcalar,Archive) and psrcalar.isCalibrator())):
-            raise ValueError("Require calibration archive")
-        # Check if cals are appropriate?
-
-
-        if isinstance(psrcalar,Calibrator):
-            cal = psrcalar
-        else:
-            # Calculate calibration levels
-            psrcalfreqs,psrcaldata,psrcalerrs = psrcalar.getLevels(differences=True)
-
-            # Check if cal has the correct dimensions, if not perform interpolation
-            freqs = self.getAxis('F')
-            if len(freqs) != len(psrcalfreqs):
-                pass
-
-            cal = Calibrator(psrcalfreqs,psrcaldata,psrcalerrs)
-        #if fluxcalon is not None:
-        #    fluxcaloncal = Calibrator(fluxcalonfreqs,fluxcalondata,fluxcalonerrs)
-        #    fluxcaloffcal = Calibrator(fluxcalofffreqs,fluxcaloffdata,fluxcalofferrs)
-
-
-
-        if fluxcalonar is not None and fluxcaloffar is not None:
-            fluxcaldata = np.zeros((npol,nchan))
-            for i in xrange(npol):
-                for j in xrange(nchan):
-                    fluxcaldata[i,j] = np.mean(fdata[i,j,highinds]) - np.mean(fdata[i,j,lowinds])
-
-        cal.applyCalibration(self)
-        return cal
-        # Apply calibrations
-
-
-
-
-
-
-
-
-
-    def getData(self,squeeze=True,setnan=None,weight=True):
-        """Returns the data array, fully squeezed"""
-        if weight:
-            data = np.zeros_like(self.data)
-            I,J,K,L = np.shape(self.data)
-            I = range(I)
-            J = range(J)
-            K = range(K)
-            for i in I:
-                #print np.shape(self.weights),np.shape(data),np.shape(self.data),i#,j,k
-                for j in J:
-                    for k in K:
-                        data[i,j,k,:] = self.data[i,j,k,:]*self.weights[i,k]
-        else:
-            data = self.data
-
-        if squeeze:
-            data = data.squeeze()
-
-        if setnan is not None:
-            data = np.where(data==setnan,np.nan,data)
-
-        return np.copy(data) #removes pointer to data
     def setData(self,newdata):
         """Sets the data, very dangerous!"""
         self.record(inspect.currentframe())
         if np.shape(newdata) == np.shape(self.data):
             self.data = np.copy(newdata)
-    def getWeights(self,squeeze=True):
+    def getWeights(self,squeeze=False):
         """ Return copy of weights array """
         weights = self.weights
         if squeeze:
@@ -749,6 +509,9 @@ class Archive:
     def getNsubint(self):
         """Returns number of subintegrations"""
         return self.shape(squeeze=False)[0]
+    def getNsblk(self):
+        """Returns number of NSBLK"""
+        return self.data.shape[1]
     def getNpol(self):
         """Returns number of polarizations"""
         return self.shape(squeeze=False)[1]
@@ -758,26 +521,6 @@ class Archive:
     def getNbin(self):
         """Returns number of phase bins"""
         return self.shape(squeeze=False)[3]
-    def getPeriod(self,header=False):
-        """Returns period of the pulsar"""
-        if self.isCalibrator():
-            return 1.0/self.header['CAL_FREQ']
-        if self.params is None:
-            return None
-        if header or self.polyco is None:
-            return self.params.getPeriod()
-        else:
-            P0 = self.polyco.calculatePeriod()
-            #print P0,self.params.getPeriod()
-            if np.abs(P0)<1e-5: #Problem with large DT POLYCO values?
-                return self.params.getPeriod()
-            else:
-                ratio = (P0-self.params.getPeriod())/self.params.getPeriod()
-                if ratio < 0.5 or ratio > 2:
-                    return self.params.getPeriod()
-            return P0
-            return self.polyco.calculatePeriod()
-    # Best replacement for without PSRCHIVE
     def getValue(self,value):
         """Looks for a key in one of the headers and returns"""
         if value in self.header.keys():
