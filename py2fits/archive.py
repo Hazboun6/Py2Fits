@@ -7,8 +7,6 @@ PSRFITS specification: www.atnf.csiro.au/people/pulsar/index.html?n=Main.Psrfits
 
 EXAMPLE USAGE:
 ar = Archive(filename)
-ar.tscrunch()
-ar.pavplot()
 
 TODO:
 
@@ -108,15 +106,43 @@ class Archive:
 
 
     def load(self,filename,prepare=False,center_pulse=False,baseline_removal=False,weight=False,wcfreq=False):
-        """
+        '''
         Loads a PSRFITS file
         http://www.atnf.csiro.au/people/pulsar/index.html?n=PsrfitsDocumentation.Txt
-        """
+
+        Parameters:
+        ==========
+
+        filename: pathname of PSRFITS file
+
+        prepare: flag
+            see reset function: 'Replace the arch
+            with the original clone'
+
+
+        center_pulse: flag
+            not sure what this does
+            possibly used elsewhere in py2fits
+
+        baseline_removal: flag
+            not sure what this does
+            possibly used elsewhere in py2fits
+
+
+        weight: possibly a flag?
+            related to the weights of data
+            possibly read in from the PSRFITS template file
+
+        wcfreq: flag
+            not sure what this does
+            possibly used elsewhere in py2fits
+
+        '''
         if filename is None: #Needed?
             filename = self.filename
         try:
             if self.lowmem:
-                hdulist = pyfits.open(filename,ignore_missing_end=True,memmap=True) #Probably don't need...
+                hdulist = pyfits.open(filename,ignore_missing_end=True, memmap=True) #Probably don't need...
             else:
                 hdulist = pyfits.open(filename,ignore_missing_end=True)
         except IOError:
@@ -201,6 +227,20 @@ class Archive:
         self.subintinfolist = fmap(lambda x: x.name, hdulist['SUBINT'].columns[:-5])
         for i,column in enumerate(hdulist['SUBINT'].columns[:-5]):
             self.subintinfo[column.name] = (column.format,column.unit,hdulist['SUBINT'].data[column.name])
+
+        #TODO possibly make self.primaryinfo
+        #not sure if needed
+
+        #Creating primary header dictionary
+        #in the same way as the secondary header
+        #dictionary is created
+        self.primaryheader = dict()
+        self.primaryheaderlist = hdulist['PRIMARY'].header.keys()
+        for i,key in enumerate(hdulist['PRIMARY'].header):
+            self.primaryheader[key] = hdulist['PRIMARY'].header[key]
+
+        #Create secondary header dictionary
+
         self.subintheader = dict()
         self.subintheaderlist = hdulist['SUBINT'].header.keys()#for ordering
         for i,key in enumerate(hdulist['SUBINT'].header):
@@ -296,10 +336,31 @@ class Archive:
 
 
     def save(self,filename):
-        """Save the file to a new FITS file"""
+        '''
+        Save the file to a new FITS file.
+        Initializes a new primary header and then
+        appends the secondary header at the end
+        of the function.
 
-        primaryhdu = pyfits.PrimaryHDU(header=self.header) #need to make alterations to header
-        hdulist = pyfits.HDUList(primaryhdu)
+        Parameters:
+        ==========
+        filename: name for new FITS file
+
+        '''
+        #Creating the new primary header to be able to change pieces
+        #of the header when needed.
+        primaryhdr = pyfits.Header()
+        for key in self.primaryheaderlist:
+            try:
+                primaryhdr[key] = self.primaryheader[key]
+            except:
+                self.primaryheader[key]=str(self.primaryheader[key]).replace('\n','')
+                primaryhdr[key] = self.primaryheader[key]
+        primaryhdu = pyfits.PrimaryHDU(header=primaryhdr) #need to make alterations to header
+
+        hdulist = pyfits.HDUList(primaryhdu)    #Don't need to append anything to hdulist
+                                                #for the primary header since this initializes
+                                                #the primary header
 
         if self.history is not None:
             cols = []
@@ -389,10 +450,11 @@ class Archive:
         for key in self.subintheaderlist:
             subinthdr[key] = self.subintheader[key]
         subinthdu = pyfits.BinTableHDU.from_columns(cols,name='SUBINT',header=subinthdr)
+
+        #Append the secondary header
         hdulist.append(subinthdu)
 
-
-
+        #Write the data
         hdulist.writeto(filename,overwrite=True)#clobber=True?
 
 
